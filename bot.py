@@ -1,6 +1,10 @@
 import logging
-from telegram import Update, ChatPermissions
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import asyncio
+from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from datetime import datetime, timedelta
+import json
+import os
 
 # Настройка логирования
 logging.basicConfig(
@@ -12,487 +16,947 @@ logger = logging.getLogger(__name__)
 # Токен бота (получите у @BotFather)
 BOT_TOKEN = "8417645903:AAHTr9rpoY_mjwPU9IKJ54r_KLK5RnujAJ0"
 
-# Команда /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Главный администратор
+MAIN_ADMIN_ID = 7668402802
+
+# Белый список аккаунтов (не блокировать)
+WHITELIST_IDS = {
+    5314493557, 7279244310, 7754541004, 8444260034, 
+    7840997504, 8185132005, 6962444738, 7431538558
+}
+
+# Белый список чатов
+ALLOWED_CHATS = {2136717768, 4974965215}
+
+# Администраторы бота
+ADMIN_IDS = {MAIN_ADMIN_ID}
+
+# Игнор-лист пользователей
+IGNORED_USERS = set()
+
+# Чат для логов
+LOG_CHAT_ID = 4974965215
+
+# Файлы для хранения данных
+DATA_FILE = "bot_data.json"
+EXAMPLE_DATA_FILE = "bot_data.example.json"
+
+# Создание файла данных если не существует
+def create_data_file_if_not_exists():
+    if not os.path.exists(DATA_FILE):
+        initial_data = {
+            'whitelist_ids': list(WHITELIST_IDS),
+            'allowed_chats': list(ALLOWED_CHATS),
+            'admin_ids': list(ADMIN_IDS),
+            'ignored_users': list(IGNORED_USERS)
+        }
+        save_data(initial_data, DATA_FILE)
+        logger.info("✅ Создан новый файл данных bot_data.json")
+
+# Создание примера файла данных
+def create_example_data_file():
+    example_data = {
+        'whitelist_ids': [5314493557, 7279244310, 7754541004, 8444260034, 7840997504, 8185132005, 6962444738, 7431538558],
+        'allowed_chats': [2136717768, 4974965215],
+        'admin_ids': [7668402802],
+        'ignored_users': []
+    }
+    save_data(example_data, EXAMPLE_DATA_FILE)
+    logger.info("✅ Создан файл примера bot_data.example.json")
+
+# Загрузка данных
+def load_data():
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data
+    except Exception as e:
+        logger.error(f"Ошибка загрузки данных: {e}")
+    return {}
+
+# Сохранение данных
+def save_data(data, filename=DATA_FILE):
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения данных: {e}")
+
+# Инициализация данных
+def init_data():
+    data = load_data()
+    global WHITELIST_IDS, ALLOWED_CHATS, ADMIN_IDS, IGNORED_USERS
+    
+    WHITELIST_IDS = set(data.get('whitelist_ids', WHITELIST_IDS))
+    ALLOWED_CHATS = set(data.get('allowed_chats', ALLOWED_CHATS))
+    ADMIN_IDS = set(data.get('admin_ids', ADMIN_IDS))
+    IGNORED_USERS = set(data.get('ignored_users', IGNORED_USERS))
+
+# Сохранение всех данных
+def save_all_data():
+    data = {
+        'whitelist_ids': list(WHITELIST_IDS),
+        'allowed_chats': list(ALLOWED_CHATS),
+        'admin_ids': list(ADMIN_IDS),
+        'ignored_users': list(IGNORED_USERS)
+    }
+    save_data(data)
+
+# Проверка разрешенного чата
+async def is_allowed_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat_id = update.effective_chat.id
+    if chat_id not in ALLOWED_CHATS and chat_id not in ADMIN_IDS:
+        if update.message and update.message.chat.type != 'private':
+            response = await update.message.reply_text("🚫 Бот работает только в чатах компании Oplatym.ru")
+            await asyncio.sleep(10)
+            try:
+                await response.delete()
+                await update.message.delete()
+            except:
+                pass
+        return False
+    return True
+
+# Проверка прав администратора бота
+def is_bot_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+# Функция для отправки логов
+async def send_log(context: ContextTypes.DEFAULT_TYPE, message: str):
+    try:
+        await context.bot.send_message(
+            chat_id=LOG_CHAT_ID,
+            text=f"📊 {message}"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка отправки лога: {e}")
+
+# Функция для отправки сообщения с автоудалением
+async def send_message_with_auto_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, parse_mode=None, reply_markup=None):
+    try:
+        message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup
+        )
+        
+        # Планируем удаление через 10 минут только в группах
+        if chat_id not in ADMIN_IDS:
+            context.job_queue.run_once(
+                delete_system_message, 
+                600,
+                data={'chat_id': chat_id, 'message_id': message.message_id},
+                name=f"delete_system_{message.message_id}"
+            )
+        
+        return message
+    except Exception as e:
+        logger.error(f"Ошибка отправки сообщения: {e}")
+        return None
+
+# Функция для удаления системных сообщений
+async def delete_system_message(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat_id = context.job.data['chat_id']
+        message_id = context.job.data['message_id']
+        
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.info(f"Системное сообщение {message_id} удалено из чата {chat_id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при удалении системного сообщения: {e}")
+
+# АДМИН ПАНЕЛЬ - Главное меню
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ У вас нет прав доступа к админ панели")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("👥 Управление пользователями", callback_data="admin_users")],
+        [InlineKeyboardButton("💬 Управление чатами", callback_data="admin_chats")],
+        [InlineKeyboardButton("🛡️ Управление администраторами", callback_data="admin_admins")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
-        "🤖 Я бот-модератор Oplatym.ru! Доступные команды:\n\n"
-        "🛠 **Команды модерации:**\n"
-        "/warn - предупредить пользователя\n"
-        "/mute - ограничить пользователя\n"
-        "/unmute - снять ограничения\n"
-        "/ban - забанить пользователя\n"
-        "/unban - разбанить пользователя\n"
-        "/kick - кикнуть пользователя\n"
-        "/id - получить ID пользователя\n\n"
-        "ℹ️ **Информационные:**\n"
-        "/help - помощь по командам\n"
-        "/rules - показать правила чата\n"
-        "/check - проверить права бота\n\n"
-        "💡 **Использование:** Ответьте на сообщение пользователя командой модерации"
+        "🛠️ **Панель администратора Oplatym.ru**\n\n"
+        "Выберите раздел для управления:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
     )
 
-# Команда /help
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """
-📋 **Помощь по командам:**
+# Обработчик callback запросов админ панели
+async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if not is_bot_admin(user_id):
+        await query.edit_message_text("❌ У вас нет прав доступа")
+        return
+    
+    data = query.data
+    
+    if data == "admin_broadcast":
+        await show_broadcast_menu(query, context)
+    elif data == "admin_users":
+        await show_users_menu(query, context)
+    elif data == "admin_chats":
+        await show_chats_menu(query, context)
+    elif data == "admin_admins":
+        await show_admins_menu(query, context)
+    elif data == "admin_stats":
+        await show_stats(query, context)
+    elif data == "admin_back":
+        await admin_panel_back(query, context)
+    elif data.startswith("broadcast_"):
+        await handle_broadcast(query, context, data)
+    elif data.startswith("user_"):
+        await handle_user_management(query, context, data)
+    elif data.startswith("chat_"):
+        await handle_chat_management(query, context, data)
+    elif data.startswith("admin_"):
+        await handle_admin_management(query, context, data)
 
-👮‍♂️ **Модерация (только для админов):**
-• Ответьте на сообщение и используйте:
-  /warn - предупредить пользователя
-  /mute - ограничить на 1 час
-  /unmute - снять ограничения  
-  /ban - забанить пользователя
-  /kick - кикнуть пользователя
+# Меню рассылки
+async def show_broadcast_menu(query, context):
+    keyboard = [
+        [InlineKeyboardButton("📢 Рассылка во все чаты", callback_data="broadcast_all")],
+        [InlineKeyboardButton("📱 Рассылка в ЛС", callback_data="broadcast_pm")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="admin_back")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "📢 **Управление рассылкой**\n\n"
+        "Выберите тип рассылки:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-• /unban ID - разбанить по ID
-• /id - получить ID пользователя
+# Меню пользователей
+async def show_users_menu(query, context):
+    ignored_count = len(IGNORED_USERS)
+    whitelist_count = len(WHITELIST_IDS)
+    
+    keyboard = [
+        [InlineKeyboardButton("🚫 Игнор-лист", callback_data="user_ignore")],
+        [InlineKeyboardButton("✅ Белый список", callback_data="user_whitelist")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="admin_back")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"👥 **Управление пользователями**\n\n"
+        f"🚫 В игнор-листе: {ignored_count} пользователей\n"
+        f"✅ В белом списке: {whitelist_count} пользователей\n\n"
+        f"Выберите действие:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-🔧 **Как разбанить:**
-1. Ответьте на сообщение пользователя командой /id
-2. Скопируйте его ID
-3. Используйте /unban ID_пользователя
+# Меню чатов
+async def show_chats_menu(query, context):
+    chats_count = len(ALLOWED_CHATS)
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить чат", callback_data="chat_add")],
+        [InlineKeyboardButton("🗑️ Удалить чат", callback_data="chat_remove")],
+        [InlineKeyboardButton("📋 Список чатов", callback_data="chat_list")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="admin_back")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"💬 **Управление чатами**\n\n"
+        f"📊 Разрешенных чатов: {chats_count}\n\n"
+        f"Выберите действие:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-ℹ️ **Информационные команды:**
-/check - проверить права бота
-/rules - показать правила чата
+# Меню администраторов
+async def show_admins_menu(query, context):
+    admins_count = len(ADMIN_IDS)
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить админа", callback_data="admin_add")],
+        [InlineKeyboardButton("🗑️ Удалить админа", callback_data="admin_remove")],
+        [InlineKeyboardButton("📋 Список админов", callback_data="admin_list")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="admin_back")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"🛡️ **Управление администраторами**\n\n"
+        f"👑 Администраторов: {admins_count}\n\n"
+        f"Выберите действие:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-⚠️ *Только администраторы могут использовать команды модерации!*
-    """
-    await update.message.reply_text(help_text)
+# Статистика
+async def show_stats(query, context):
+    stats_text = (
+        f"📊 **Статистика бота**\n\n"
+        f"💬 Разрешенных чатов: {len(ALLOWED_CHATS)}\n"
+        f"👥 Пользователей в белом списке: {len(WHITELIST_IDS)}\n"
+        f"🚫 Пользователей в игнор-листе: {len(IGNORED_USERS)}\n"
+        f"👑 Администраторов: {len(ADMIN_IDS)}\n\n"
+        f"🕒 Бот запущен: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data="admin_stats")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="admin_back")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(stats_text, reply_markup=reply_markup, parse_mode='Markdown')
 
-# Команда /rules
-async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rules_text = """
-📜 **Правила чата Oplatym.ru:**
+# Назад в главное меню
+async def admin_panel_back(query, context):
+    await admin_panel(update=Update(update_id=query.update_id, message=query.message), context=context)
 
-1. 🚫 Запрещён спам и флуд
-2. 🚫 Запрещены оскорбления и нецензурная лексика
-3. 🚫 Запрещена реклама без согласования
-4. 🚫 Запрещено мошенничество и обман
-5. ✅ Уважайте других участников
-6. ✅ Соблюдайте тематику чата
-7. ✅ Ведите себя культурно
-
-‼️ **ВНИМАНИЕ МОШЕННИКИ!**
-• Мы первые не пишем!
-• Будьте бдительны при общении
-• Переходите только через официальные аккаунты
-
-Нарушение правил ведёт к предупреждениям, муту или бану!
-    """
-    await update.message.reply_text(rules_text)
-
-# Команда для проверки прав бота
-async def check_rights(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        chat_member = await context.bot.get_chat_member(update.message.chat_id, context.bot.id)
-        rights_info = (
-            f"🤖 **Статус бота:** {chat_member.status}\n"
-            f"👑 **Права администратора:** {chat_member.status in ['administrator', 'creator']}\n"
-            f"📊 **ID чата:** {update.message.chat_id}\n"
-            f"💬 **Бот видит сообщения:** Да\n"
-            f"✉️ **Бот может отправлять сообщения:** Да"
+# Обработка рассылки
+async def handle_broadcast(query, context, data):
+    if data == "broadcast_all":
+        context.user_data['awaiting_broadcast'] = 'all'
+        await query.edit_message_text(
+            "📢 **Рассылка во все чаты**\n\n"
+            "Отправьте сообщение для рассылки во все разрешенные чаты:",
+            parse_mode='Markdown'
         )
+    elif data == "broadcast_pm":
+        context.user_data['awaiting_broadcast'] = 'pm'
+        await query.edit_message_text(
+            "📱 **Рассылка в личные сообщения**\n\n"
+            "Отправьте сообщение для рассылки всем пользователям из белого списка:",
+            parse_mode='Markdown'
+        )
+
+# Обработка управления пользователями
+async def handle_user_management(query, context, data):
+    if data == "user_ignore":
+        await show_ignore_management(query, context)
+    elif data == "user_whitelist":
+        await show_whitelist_management(query, context)
+
+# Показать управление игнор-листом
+async def show_ignore_management(query, context):
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить в игнор", callback_data="user_ignore_add")],
+        [InlineKeyboardButton("🗑️ Удалить из игнора", callback_data="user_ignore_remove")],
+        [InlineKeyboardButton("📋 Список игнора", callback_data="user_ignore_list")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="admin_users")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"🚫 **Управление игнор-листом**\n\n"
+        f"Пользователей в игноре: {len(IGNORED_USERS)}\n\n"
+        f"Выберите действие:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+# Показать управление белым списком
+async def show_whitelist_management(query, context):
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить в белый список", callback_data="user_whitelist_add")],
+        [InlineKeyboardButton("🗑️ Удалить из белого списка", callback_data="user_whitelist_remove")],
+        [InlineKeyboardButton("📋 Белый список", callback_data="user_whitelist_list")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="admin_users")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"✅ **Управление белым списком**\n\n"
+        f"Пользователей в белом списке: {len(WHITELIST_IDS)}\n\n"
+        f"Выберите действие:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+# Обработка управления чатами
+async def handle_chat_management(query, context, data):
+    if data == "chat_add":
+        context.user_data['awaiting_chat_add'] = True
+        await query.edit_message_text(
+            "➕ **Добавление чата**\n\n"
+            "Перешлите любое сообщение из чата который хотите добавить, "
+            "или отправьте ID чата (число, можно получить через /id в нужном чате):",
+            parse_mode='Markdown'
+        )
+    elif data == "chat_remove":
+        await show_chat_remove_menu(query, context)
+    elif data == "chat_list":
+        await show_chat_list(query, context)
+
+# Обработка управления администраторами
+async def handle_admin_management(query, context, data):
+    if data == "admin_add":
+        context.user_data['awaiting_admin_add'] = True
+        await query.edit_message_text(
+            "➕ **Добавление администратора**\n\n"
+            "Перешлите сообщение пользователя или отправьте его ID:",
+            parse_mode='Markdown'
+        )
+    elif data == "admin_remove":
+        await show_admin_remove_menu(query, context)
+    elif data == "admin_list":
+        await show_admin_list(query, context)
+
+# Показать список чатов для удаления
+async def show_chat_remove_menu(query, context):
+    if not ALLOWED_CHATS:
+        await query.edit_message_text("❌ Нет добавленных чатов")
+        return
+    
+    keyboard = []
+    for chat_id in ALLOWED_CHATS:
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            chat_name = chat.title or "Личные сообщения"
+            keyboard.append([InlineKeyboardButton(f"🗑️ {chat_name}", callback_data=f"chat_remove_{chat_id}")])
+        except:
+            keyboard.append([InlineKeyboardButton(f"🗑️ Чат {chat_id}", callback_data=f"chat_remove_{chat_id}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_chats")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "🗑️ **Удаление чата**\n\n"
+        "Выберите чат для удаления:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+# Показать список администраторов для удаления
+async def show_admin_remove_menu(query, context):
+    if len(ADMIN_IDS) <= 1:
+        await query.edit_message_text("❌ Нельзя удалить единственного администратора")
+        return
+    
+    keyboard = []
+    for admin_id in ADMIN_IDS:
+        if admin_id == MAIN_ADMIN_ID:
+            continue
+        try:
+            user = await context.bot.get_chat(admin_id)
+            user_name = user.first_name or "Пользователь"
+            keyboard.append([InlineKeyboardButton(f"🗑️ {user_name}", callback_data=f"admin_remove_{admin_id}")])
+        except:
+            keyboard.append([InlineKeyboardButton(f"🗑️ ID {admin_id}", callback_data=f"admin_remove_{admin_id}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_admins")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "🗑️ **Удаление администратора**\n\n"
+        "Выберите администратора для удаления:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+# Показать список чатов
+async def show_chat_list(query, context):
+    if not ALLOWED_CHATS:
+        await query.edit_message_text("❌ Нет добавленных чатов")
+        return
+    
+    chats_text = "📋 **Список разрешенных чатов:**\n\n"
+    for i, chat_id in enumerate(ALLOWED_CHATS, 1):
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            chat_name = chat.title or "Личные сообщения"
+            chats_text += f"{i}. {chat_name} (ID: `{chat_id}`)\n"
+        except:
+            chats_text += f"{i}. Чат {chat_id}\n"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="admin_chats")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(chats_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# Показать список администраторов
+async def show_admin_list(query, context):
+    admins_text = "👑 **Список администраторов:**\n\n"
+    for i, admin_id in enumerate(ADMIN_IDS, 1):
+        try:
+            user = await context.bot.get_chat(admin_id)
+            user_name = user.first_name or "Пользователь"
+            status = "👑 Главный" if admin_id == MAIN_ADMIN_ID else "🛡️ Админ"
+            admins_text += f"{i}. {user_name} {status} (ID: `{admin_id}`)\n"
+        except:
+            admins_text += f"{i}. Пользователь {admin_id}\n"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="admin_admins")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(admins_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# Обработка текстовых сообщений для админ панели
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_admin(update.effective_user.id):
+        return
+    
+    user_data = context.user_data
+    
+    # Обработка рассылки
+    if 'awaiting_broadcast' in user_data:
+        broadcast_type = user_data['awaiting_broadcast']
+        del user_data['awaiting_broadcast']
         
-        await update.message.reply_text(rights_info)
+        message_text = update.message.text
+        success_count = 0
+        total_count = 0
         
-        # Дополнительная проверка для приветствий
-        if chat_member.status not in ['administrator', 'creator']:
+        if broadcast_type == 'all':
+            targets = ALLOWED_CHATS
+            target_name = "чаты"
+        else:  # broadcast_type == 'pm'
+            targets = WHITELIST_IDS
+            target_name = "пользователи"
+        
+        total_count = len(targets)
+        
+        await update.message.reply_text(f"🔄 Начинаю рассылку для {total_count} {target_name}...")
+        
+        for target_id in targets:
+            try:
+                await context.bot.send_message(chat_id=target_id, text=message_text)
+                success_count += 1
+                await asyncio.sleep(0.1)  # Задержка чтобы не превысить лимиты
+            except Exception as e:
+                logger.error(f"Ошибка рассылки для {target_id}: {e}")
+        
+        await update.message.reply_text(
+            f"✅ Рассылка завершена!\n"
+            f"📤 Успешно: {success_count}/{total_count}"
+        )
+        return
+    
+    # Обработка добавления чата
+    if 'awaiting_chat_add' in user_data:
+        del user_data['awaiting_chat_add']
+        
+        if update.message.forward_from_chat:
+            chat_id = update.message.forward_from_chat.id
+        else:
+            try:
+                chat_id = int(update.message.text)
+            except ValueError:
+                await update.message.reply_text("❌ Неверный формат ID чата")
+                return
+        
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            ALLOWED_CHATS.add(chat_id)
+            save_all_data()
+            
             await update.message.reply_text(
-                "⚠️ **ВНИМАНИЕ:** Бот не администратор!\n"
-                "Приветствия и модерация могут не работать.\n"
-                "Назначьте бота администратором с правами:\n"
-                "• Удаление сообщений\n"
-                "• Блокировка пользователей\n"
-                "• Ограничение пользователей"
+                f"✅ Чат \"{chat.title}\" (ID: {chat_id}) добавлен в белый список"
             )
+            await send_log(context, f"Админ {update.message.from_user.first_name} добавил чат {chat.title} ({chat_id})")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка добавления чата: {e}")
+        return
+    
+    # Обработка добавления администратора
+    if 'awaiting_admin_add' in user_data:
+        del user_data['awaiting_admin_add']
+        
+        if update.message.forward_from:
+            user_id = update.message.forward_from.id
         else:
-            await update.message.reply_text("✅ Бот имеет права администратора! Все функции активны.")
+            try:
+                user_id = int(update.message.text)
+            except ValueError:
+                await update.message.reply_text("❌ Неверный формат ID пользователя")
+                return
+        
+        try:
+            user = await context.bot.get_chat(user_id)
+            ADMIN_IDS.add(user_id)
+            save_all_data()
             
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка проверки прав: {e}")
+            await update.message.reply_text(
+                f"✅ Пользователь {user.first_name} (ID: {user_id}) добавлен как администратор"
+            )
+            await send_log(context, f"Админ {update.message.from_user.first_name} добавил администратора {user.first_name} ({user_id})")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка добавления администратора: {e}")
+        return
 
-# Команда для получения ID пользователя
-async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.reply_to_message:
-        user = update.message.reply_to_message.from_user
-        await update.message.reply_text(
-            f"👤 **Информация о пользователе:**\n"
-            f"🆔 **ID:** `{user.id}`\n"
-            f"📛 **Имя:** {user.first_name}\n"
-            f"🔗 **Username:** @{user.username if user.username else 'нет'}\n"
-            f"👥 **Полное имя:** {user.full_name}\n\n"
-            f"💡 **Для разбана используйте:** `/unban {user.id}`",
+# Обработка callback для удаления чатов и администраторов
+async def handle_remove_callback(query, context, data):
+    if data.startswith("chat_remove_"):
+        chat_id = int(data.split('_')[2])
+        
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            chat_name = chat.title
+        except:
+            chat_name = f"чат {chat_id}"
+        
+        ALLOWED_CHATS.discard(chat_id)
+        save_all_data()
+        
+        await query.edit_message_text(f"✅ Чат \"{chat_name}\" удален из белого списка")
+        await send_log(context, f"Админ {query.from_user.first_name} удалил чат {chat_name} ({chat_id})")
+        
+    elif data.startswith("admin_remove_"):
+        admin_id = int(data.split('_')[2])
+        
+        if admin_id == MAIN_ADMIN_ID:
+            await query.answer("❌ Нельзя удалить главного администратора", show_alert=True)
+            return
+        
+        try:
+            user = await context.bot.get_chat(admin_id)
+            user_name = user.first_name
+        except:
+            user_name = f"пользователь {admin_id}"
+        
+        ADMIN_IDS.discard(admin_id)
+        save_all_data()
+        
+        await query.edit_message_text(f"✅ Администратор {user_name} удален")
+        await send_log(context, f"Админ {query.from_user.first_name} удалил администратора {user_name} ({admin_id})")
+
+# Обработка callback для пользователей
+async def handle_user_callback(query, context, data):
+    if data == "user_ignore_add":
+        context.user_data['awaiting_ignore_add'] = True
+        await query.edit_message_text(
+            "🚫 **Добавление в игнор-лист**\n\n"
+            "Перешлите сообщение пользователя или отправьте его ID:",
             parse_mode='Markdown'
         )
-    else:
-        await update.message.reply_text(
-            "❌ Ответьте на сообщение пользователя чтобы получить его ID!\n\n"
-            "**Пример использования:**\n"
-            "1. Найдите сообщение пользователя\n"
-            "2. Ответьте на него командой /id\n"
-            "3. Бот покажет ID пользователя"
-        )
-
-# Проверка прав администратора
-async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    try:
-        user = await context.bot.get_chat_member(update.message.chat_id, update.message.from_user.id)
-        return user.status in ['administrator', 'creator']
-    except Exception as e:
-        logger.error(f"Ошибка проверки прав: {e}")
-        return False
-
-# Получить пользователя из сообщения
-async def get_mentioned_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if update.message.reply_to_message:
-            return update.message.reply_to_message.from_user
-        
-        if context.args:
-            # Пытаемся получить user_id из аргумента
-            if context.args[0].isdigit():
-                return int(context.args[0])
-            else:
-                await update.message.reply_text("❌ Для этой команды лучше ответьте на сообщение пользователя!")
-                return None
-        
-        await update.message.reply_text("❌ Укажите пользователя или ответьте на его сообщение!")
-        return None
-    except Exception as e:
-        logger.error(f"Ошибка получения пользователя: {e}")
-        return None
-
-# Команда /warn
-async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        await update.message.reply_text("❌ Эта команда только для администраторов!")
-        return
-    
-    target_user = await get_mentioned_user(update, context)
-    if not target_user:
-        return
-    
-    if isinstance(target_user, int):
-        await update.message.reply_text(f"⚠️ Пользователю ID {target_user} выдано предупреждение!")
-    else:
-        await update.message.reply_text(
-            f"⚠️ Пользователю {target_user.mention_html()} выдано предупреждение!\n"
-            f"📜 Пожалуйста, ознакомьтесь с правилами: /rules",
-            parse_mode='HTML'
-        )
-
-# Команда /mute
-async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        await update.message.reply_text("❌ Эта команда только для администраторов!")
-        return
-    
-    target_user = await get_mentioned_user(update, context)
-    if not target_user:
-        return
-    
-    if isinstance(target_user, int):
-        await update.message.reply_text("❌ Мут можно выдать только ответом на сообщение!")
-        return
-    
-    try:
-        permissions = ChatPermissions(
-            can_send_messages=False,
-            can_send_media_messages=False,
-            can_send_polls=False,
-            can_send_other_messages=False,
-            can_add_web_page_previews=False,
-            can_change_info=False,
-            can_invite_users=False,
-            can_pin_messages=False
-        )
-        
-        await context.bot.restrict_chat_member(
-            chat_id=update.message.chat_id,
-            user_id=target_user.id,
-            permissions=permissions,
-            until_date=3600  # 1 час
-        )
-        
-        await update.message.reply_text(
-            f"🔇 Пользователь {target_user.mention_html()} ограничен на 1 час!\n"
-            f"⏰ Ограничение будет снято автоматически через 1 час.",
-            parse_mode='HTML'
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при муте: {e}")
-        await update.message.reply_text("❌ Не удалось ограничить пользователя! Проверьте права бота.")
-
-# Команда /unmute
-async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        await update.message.reply_text("❌ Эта команда только для администраторов!")
-        return
-    
-    target_user = await get_mentioned_user(update, context)
-    if not target_user:
-        return
-    
-    if isinstance(target_user, int):
-        await update.message.reply_text("❌ Размут можно выдать только ответом на сообщение!")
-        return
-    
-    try:
-        permissions = ChatPermissions(
-            can_send_messages=True,
-            can_send_media_messages=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
-            can_change_info=False,
-            can_invite_users=False,
-            can_pin_messages=False
-        )
-        
-        await context.bot.restrict_chat_member(
-            chat_id=update.message.chat_id,
-            user_id=target_user.id,
-            permissions=permissions
-        )
-        
-        await update.message.reply_text(
-            f"🔊 С пользователя {target_user.mention_html()} сняты ограничения!",
-            parse_mode='HTML'
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при размуте: {e}")
-        await update.message.reply_text("❌ Не удалось снять ограничения!")
-
-# Команда /ban
-async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        await update.message.reply_text("❌ Эта команда только для администраторов!")
-        return
-    
-    target_user = await get_mentioned_user(update, context)
-    if not target_user:
-        return
-    
-    if isinstance(target_user, int):
-        await update.message.reply_text("❌ Бан можно выдать только ответом на сообщение!")
-        return
-    
-    try:
-        await context.bot.ban_chat_member(
-            chat_id=update.message.chat_id,
-            user_id=target_user.id
-        )
-        
-        await update.message.reply_text(
-            f"🚫 Пользователь {target_user.mention_html()} забанен!",
-            parse_mode='HTML'
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при бане: {e}")
-        await update.message.reply_text("❌ Не удалось забанить пользователя! Проверьте права бота.")
-
-# Команда /unban - ИСПРАВЛЕННАЯ
-async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        await update.message.reply_text("❌ Эта команда только для администраторов!")
-        return
-    
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Укажите ID пользователя для разбана!\n\n"
-            "📝 **Как использовать:**\n"
-            "`/unban 123456789` - разбанить по ID\n\n"
-            "💡 **Как получить ID?**\n"
-            "Ответьте на сообщение пользователя командой `/id`"
-        )
-        return
-    
-    try:
-        user_id = int(context.args[0])
-        
-        await context.bot.unban_chat_member(
-            chat_id=update.message.chat_id,
-            user_id=user_id
-        )
-        
-        await update.message.reply_text(f"✅ Пользователь ID `{user_id}` разбанен!", parse_mode='Markdown')
-        
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Неверный формат ID! Укажите числовой ID пользователя.\n"
-            "Пример: `/unban 123456789`",
+    elif data == "user_ignore_remove":
+        await show_ignore_remove_menu(query, context)
+    elif data == "user_ignore_list":
+        await show_ignore_list(query, context)
+    elif data == "user_whitelist_add":
+        context.user_data['awaiting_whitelist_add'] = True
+        await query.edit_message_text(
+            "✅ **Добавление в белый список**\n\n"
+            "Перешлите сообщение пользователя или отправьте его ID:",
             parse_mode='Markdown'
         )
-    except Exception as e:
-        logger.error(f"Ошибка при разбане: {e}")
-        error_msg = str(e)
-        if "user not found" in error_msg.lower():
-            await update.message.reply_text("❌ Пользователь не найден или не забанен!")
-        elif "not enough rights" in error_msg.lower():
-            await update.message.reply_text("❌ У бота недостаточно прав для разбана!")
+    elif data == "user_whitelist_remove":
+        await show_whitelist_remove_menu(query, context)
+    elif data == "user_whitelist_list":
+        await show_whitelist_list(query, context)
+    elif data.startswith("ignore_remove_"):
+        await handle_ignore_remove(query, context, data)
+    elif data.startswith("whitelist_remove_"):
+        await handle_whitelist_remove(query, context, data)
+
+# Показать меню удаления из игнора
+async def show_ignore_remove_menu(query, context):
+    if not IGNORED_USERS:
+        await query.edit_message_text("❌ Игнор-лист пуст")
+        return
+    
+    keyboard = []
+    for user_id in IGNORED_USERS:
+        try:
+            user = await context.bot.get_chat(user_id)
+            user_name = user.first_name or "Пользователь"
+            keyboard.append([InlineKeyboardButton(f"✅ {user_name}", callback_data=f"ignore_remove_{user_id}")])
+        except:
+            keyboard.append([InlineKeyboardButton(f"✅ ID {user_id}", callback_data=f"ignore_remove_{user_id}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="user_ignore")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "✅ **Удаление из игнор-листа**\n\n"
+        "Выберите пользователя для удаления:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+# Показать меню удаления из белого списка
+async def show_whitelist_remove_menu(query, context):
+    if not WHITELIST_IDS:
+        await query.edit_message_text("❌ Белый список пуст")
+        return
+    
+    keyboard = []
+    for user_id in WHITELIST_IDS:
+        try:
+            user = await context.bot.get_chat(user_id)
+            user_name = user.first_name or "Пользователь"
+            keyboard.append([InlineKeyboardButton(f"🗑️ {user_name}", callback_data=f"whitelist_remove_{user_id}")])
+        except:
+            keyboard.append([InlineKeyboardButton(f"🗑️ ID {user_id}", callback_data=f"whitelist_remove_{user_id}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="user_whitelist")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "🗑️ **Удаление из белого списка**\n\n"
+        "Выберите пользователя для удаления:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+# Показать список игнора
+async def show_ignore_list(query, context):
+    if not IGNORED_USERS:
+        await query.edit_message_text("❌ Игнор-лист пуст")
+        return
+    
+    ignore_text = "🚫 **Список игнор-листа:**\n\n"
+    for i, user_id in enumerate(IGNORED_USERS, 1):
+        try:
+            user = await context.bot.get_chat(user_id)
+            user_name = user.first_name or "Пользователь"
+            ignore_text += f"{i}. {user_name} (ID: `{user_id}`)\n"
+        except:
+            ignore_text += f"{i}. Пользователь {user_id}\n"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="user_ignore")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(ignore_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# Показать белый список
+async def show_whitelist_list(query, context):
+    if not WHITELIST_IDS:
+        await query.edit_message_text("❌ Белый список пуст")
+        return
+    
+    whitelist_text = "✅ **Белый список пользователей:**\n\n"
+    for i, user_id in enumerate(WHITELIST_IDS, 1):
+        try:
+            user = await context.bot.get_chat(user_id)
+            user_name = user.first_name or "Пользователь"
+            whitelist_text += f"{i}. {user_name} (ID: `{user_id}`)\n"
+        except:
+            whitelist_text += f"{i}. Пользователь {user_id}\n"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="user_whitelist")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(whitelist_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# Удалить из игнора
+async def handle_ignore_remove(query, context, data):
+    user_id = int(data.split('_')[2])
+    
+    try:
+        user = await context.bot.get_chat(user_id)
+        user_name = user.first_name
+    except:
+        user_name = f"пользователь {user_id}"
+    
+    IGNORED_USERS.discard(user_id)
+    save_all_data()
+    
+    await query.edit_message_text(f"✅ Пользователь {user_name} удален из игнор-листа")
+    await send_log(context, f"Админ {query.from_user.first_name} удалил из игнора {user_name} ({user_id})")
+
+# Удалить из белого списка
+async def handle_whitelist_remove(query, context, data):
+    user_id = int(data.split('_')[2])
+    
+    try:
+        user = await context.bot.get_chat(user_id)
+        user_name = user.first_name
+    except:
+        user_name = f"пользователь {user_id}"
+    
+    WHITELIST_IDS.discard(user_id)
+    save_all_data()
+    
+    await query.edit_message_text(f"✅ Пользователь {user_name} удален из белого списка")
+    await send_log(context, f"Админ {query.from_user.first_name} удалил из белого списка {user_name} ({user_id})")
+
+# Обработка текстовых сообщений для управления пользователями
+async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_admin(update.effective_user.id):
+        return
+    
+    user_data = context.user_data
+    
+    # Добавление в игнор
+    if 'awaiting_ignore_add' in user_data:
+        del user_data['awaiting_ignore_add']
+        
+        if update.message.forward_from:
+            user_id = update.message.forward_from.id
         else:
-            await update.message.reply_text(f"❌ Не удалось разбанить пользователя! Ошибка: {error_msg}")
-
-# Команда /kick
-async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        await update.message.reply_text("❌ Эта команда только для администраторов!")
-        return
-    
-    target_user = await get_mentioned_user(update, context)
-    if not target_user:
-        return
-    
-    if isinstance(target_user, int):
-        await update.message.reply_text("❌ Кик можно выдать только ответом на сообщение!")
-        return
-    
-    try:
-        await context.bot.ban_chat_member(
-            chat_id=update.message.chat_id,
-            user_id=target_user.id
-        )
+            try:
+                user_id = int(update.message.text)
+            except ValueError:
+                await update.message.reply_text("❌ Неверный формат ID пользователя")
+                return
         
-        await context.bot.unban_chat_member(
-            chat_id=update.message.chat_id,
-            user_id=target_user.id
-        )
-        
-        await update.message.reply_text(
-            f"👢 Пользователь {target_user.mention_html()} кикнут из чата!",
-            parse_mode='HTML'
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при кике: {e}")
-        await update.message.reply_text("❌ Не удалось кикнуть пользователя!")
-
-# Обновленное приветствие новых участников
-async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        print(f"🔔 Новые участники обнаружены: {len(update.message.new_chat_members)}")
-        
-        for member in update.message.new_chat_members:
-            print(f"👤 Обрабатываем: {member.first_name} (ID: {member.id})")
+        try:
+            user = await context.bot.get_chat(user_id)
+            IGNORED_USERS.add(user_id)
+            save_all_data()
             
-            if member.id == context.bot.id:
-                # Бот добавлен в чат
-                await update.message.reply_text(
-                    "🤖 Привет! Я бот-модератор Oplatym.ru. "
-                    "Дайте мне права администратора для полноценной работы. "
-                    "Используйте /help для списка команд."
-                )
-                print("✅ Бот добавлен в чат")
-            else:
-                # Новый пользователь - ОБНОВЛЕННОЕ ПРИВЕТСТВИЕ
-                welcome_message = (
-                    f"👋 Добро пожаловать в Oplatym.ru!\n\n"
-                    f"Мы рады видеть вас в нашем чате, пожалуйста ознакомьтесь с предупреждением ниже!\n\n"
-                    f"‼️ ВАЖНО: ОСТЕРЕГАЙТЕСЬ МОШЕННИКОВ ‼️\n\n"
-                    f"В последнее время участились случаи мошенничества.\n"
-                    f"Обращаем ваше внимание: мы никогда не пишем первыми.\n"
-                    f"Переходите в наши аккаунты только через ссылки, указанные в этом сообщении:\n\n"
-                    f"🔐 <b>Официальные аккаунты Oplatym.ru</b>\n\n"
-                    f"<b>Оплата сервисов:</b>\n"
-                    f"- @OplatymRU\n"
-                    f"- @ByOplatymRu\n"
-                    f"- @oplatymManager3\n"
-                    f"- @OplatymRu4\n\n"
-                    f"<b>Денежные переводы:</b>\n"
-                    f"- @oplatym_exchange07\n"
-                    f"- @Oplatym_exchange20\n\n"
-                    f"<b>Alipay:</b>\n"
-                    f"- @CNYExchangeOplatym\n"
-                    f"- @CNYExchangeOplatym2\n\n"
-                    f"<i>Рады приветствовать вас, {member.mention_html()}! 🎉</i>"
-                )
-                sent_message = await update.message.reply_html(welcome_message)
-                print(f"✅ Приветствие отправлено для {member.first_name}, ID сообщения: {sent_message.message_id}")
-                
-    except Exception as e:
-        error_msg = f"❌ Ошибка в приветствии: {e}"
-        print(error_msg)
-        logger.error(error_msg)
-
-# Автоответы на ключевые слова
-async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        message_text = update.message.text.lower()
+            await update.message.reply_text(
+                f"🚫 Пользователь {user.first_name} (ID: {user_id}) добавлен в игнор-лист"
+            )
+            await send_log(context, f"Админ {update.message.from_user.first_name} добавил в игнор {user.first_name} ({user_id})")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка добавления в игнор: {e}")
+        return
+    
+    # Добавление в белый список
+    if 'awaiting_whitelist_add' in user_data:
+        del user_data['awaiting_whitelist_add']
         
-        # Ключевые слова для оплаты, пополнения и перевода
-        payment_keywords = [
-            'как пополнить', 'как оплатить', 'как купить', 'как перевести',
-            'хочу оплатить', 'хочу купить', 'хочу пополнить', 'хочу перевести',
-            'произвести оплату', 'сделать перевод'
+        if update.message.forward_from:
+            user_id = update.message.forward_from.id
+        else:
+            try:
+                user_id = int(update.message.text)
+            except ValueError:
+                await update.message.reply_text("❌ Неверный формат ID пользователя")
+                return
+        
+        try:
+            user = await context.bot.get_chat(user_id)
+            WHITELIST_IDS.add(user_id)
+            save_all_data()
+            
+            await update.message.reply_text(
+                f"✅ Пользователь {user.first_name} (ID: {user_id}) добавлен в белый список"
+            )
+            await send_log(context, f"Админ {update.message.from_user.first_name} добавил в белый список {user.first_name} ({user_id})")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка добавления в белый список: {e}")
+        return
+
+# Обновленный обработчик callback
+async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if not is_bot_admin(user_id):
+        await query.edit_message_text("❌ У вас нет прав доступа")
+        return
+    
+    data = query.data
+    
+    if data == "admin_broadcast":
+        await show_broadcast_menu(query, context)
+    elif data == "admin_users":
+        await show_users_menu(query, context)
+    elif data == "admin_chats":
+        await show_chats_menu(query, context)
+    elif data == "admin_admins":
+        await show_admins_menu(query, context)
+    elif data == "admin_stats":
+        await show_stats(query, context)
+    elif data == "admin_back":
+        await admin_panel_back(query, context)
+    elif data.startswith("broadcast_"):
+        await handle_broadcast(query, context, data)
+    elif data.startswith("user_"):
+        await handle_user_callback(query, context, data)
+    elif data.startswith("chat_"):
+        await handle_chat_management(query, context, data)
+    elif data.startswith("admin_"):
+        if data.startswith("admin_remove_"):
+            await handle_remove_callback(query, context, data)
+        else:
+            await handle_admin_management(query, context, data)
+    elif data.startswith("ignore_") or data.startswith("whitelist_"):
+        await handle_user_callback(query, context, data)
+
+# Команда для админ панели
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat.type != 'private':
+        await update.message.reply_text("🛠️ Админ панель доступна только в личных сообщениях с ботом")
+        return
+    
+    await admin_panel(update, context)
+
+# Команда /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed_chat(update, context):
+        return
+    
+    await send_log(context, f"Команда /start от {update.message.from_user.first_name} в чате {update.message.chat_id}")
+    
+    if is_bot_admin(update.effective_user.id):
+        # Для администраторов показываем расширенное меню
+        keyboard = [
+            [InlineKeyboardButton("🛠️ Админ панель", callback_data="admin_panel")],
+            [InlineKeyboardButton("📋 Команды бота", callback_data="bot_commands")]
         ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Проверяем содержит ли сообщение ключевые слова
-        if any(keyword in message_text for keyword in payment_keywords):
-            reply_message = (
-                f"👋 Уважаемый клиент,\n\n"
-                f"Обратитесь в один из наших аккаунтов:\n\n"
-                f"<b>Оплата сервисов:</b>\n"
-                f"- @OplatymRU\n"
-                f"- @ByOplatymRu\n"
-                f"- @oplatymManager3\n"
-                f"- @OplatymRu4\n\n"
-                f"<b>Денежные переводы:</b>\n"
-                f"- @oplatym_exchange07\n"
-                f"- @Oplatym_exchange20\n\n"
-                f"<b>Alipay:</b>\n"
-                f"- @CNYExchangeOplatym\n"
-                f"- @CNYExchangeOplatym2\n\n"
-                f"_________________________________________\n\n"
-                f"<i>К вашему сведению, мы первыми не пишем! Пожалуйста остерегайтесь мошенников.</i>"
-            )
-            
-            await update.message.reply_html(reply_message)
-            print(f"✅ Автоответ отправлен пользователю {update.message.from_user.first_name}")
-            
-    except Exception as e:
-        logger.error(f"Ошибка в автоответе: {e}")
-
-# Обработка ошибок
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Ошибка: {context.error}")
+        await update.message.reply_text(
+            "🤖 Я бот-модератор Oplatym.ru!\n\n"
+            "Выберите действие:",
+            reply_markup=reply_markup
+        )
+    else:
+        await send_message_with_auto_delete(
+            context,
+            update.message.chat_id,
+            "🤖 Я бот-модератор Oplatym.ru!\n\n"
+            "🛠 **Основные команды:**\n"
+            "/help - помощь по командам\n"
+            "/rules - правила чата\n\n"
+            "💡 Бот автоматически модерирует чат и помогает с безопасностью.",
+            parse_mode='HTML'
+        )
 
 # Основная функция
 def main():
+    # Создание файлов данных при первом запуске
+    create_data_file_if_not_exists()
+    create_example_data_file()
+    
+    # Инициализация данных
+    init_data()
+    
     # Создаём приложение
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Обработчики команд
+    # Обработчики админ панели
+    application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("rules", rules))
-    application.add_handler(CommandHandler("check", check_rights))
-    application.add_handler(CommandHandler("id", get_id))
-    application.add_handler(CommandHandler("warn", warn_user))
-    application.add_handler(CommandHandler("mute", mute_user))
-    application.add_handler(CommandHandler("unmute", unmute_user))
-    application.add_handler(CommandHandler("ban", ban_user))
-    application.add_handler(CommandHandler("unban", unban_user))
-    application.add_handler(CommandHandler("kick", kick_user))
-
-    # Обработчик новых участников
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
+    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^admin_"))
+    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^broadcast_"))
+    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^user_"))
+    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^chat_"))
+    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^ignore_"))
+    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^whitelist_"))
+    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^admin_panel"))
+    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^bot_commands"))
     
-    # Обработчик автоответов на ключевые слова
+    # Обработчики текстовых сообщений для админ панели
     application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, 
-        auto_reply
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, 
+        handle_admin_text
+    ))
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, 
+        handle_user_text
     ))
 
-    # Обработчик ошибок
-    application.add_error_handler(error_handler)
+    # [ЗДЕСЬ ДОЛЖНЫ БЫТЬ ВСЕ ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ИЗ ПРЕДЫДУЩЕГО КОДА]
 
     # Запуск бота
-    print("🟢 Бот Oplatym.ru запущен и ожидает события...")
-    print("📝 Доступные команды: /start, /help, /check, /id, /warn, /mute, /unmute, /ban, /unban, /kick")
-    print("🔍 Автоответы активны для ключевых слов:")
-    print("   - 'как пополнить', 'как оплатить', 'как купить', 'как перевести'")
-    print("   - 'хочу оплатить', 'хочу купить', 'хочу пополнить', 'хочу перевести'")
-    print("   - 'произвести оплату', 'сделать перевод'")
+    print("🟢 Бот Oplatym.ru запущен с админ панелью!")
+    print("👑 Главный администратор:", MAIN_ADMIN_ID)
+    print("💬 Разрешенные чаты:", ALLOWED_CHATS)
+    print("📁 Созданы файлы: bot_data.json и bot_data.example.json")
     application.run_polling()
 
 if __name__ == "__main__":
