@@ -14,7 +14,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Токен бота (получите у @BotFather)
-BOT_TOKEN = "8417645903:AAGgtXC134vvme2lpIW0WRfujAzxu9oQyWI"
+BOT_TOKEN = "8420895702:AAE54hLFxjNyWyP7MkW1StwCoHEqXJEFOZY"
 
 # Главный администратор
 MAIN_ADMIN_ID = 7668402802
@@ -961,4 +961,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
